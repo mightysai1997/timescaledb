@@ -143,7 +143,7 @@ DataFetcherType ts_data_node_fetcher_scan_type = AutoFetcherType;
 /*
  * A simplehash hash table that records the chunks and their corresponding
  * hypertables, and also the plain baserels. We use it to tell whether a
- * relation is a hypertable chunk, inside the classify_relation function.
+ * relation is a hypertable chunk, inside the ts_classify_relation function.
  * It is valid inside the scope of timescaledb_planner().
  * That function can be called recursively, e.g. when we evaluate a SQL function,
  * and this cache is initialized only at the top-level call.
@@ -716,8 +716,8 @@ get_or_add_baserel_from_cache(Oid chunk_reloid, Oid parent_reloid)
  * This makes use of cache warming that happened during Query preprocessing in
  * the first planner hook.
  */
-static TsRelType
-classify_relation(const PlannerInfo *root, const RelOptInfo *rel, Hypertable **ht)
+TsRelType
+ts_classify_relation(const PlannerInfo *root, const RelOptInfo *rel, Hypertable **ht)
 {
 	Assert(ht != NULL);
 	*ht = NULL;
@@ -1162,7 +1162,7 @@ timescaledb_set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, Rang
 		return;
 	}
 
-	reltype = classify_relation(root, rel, &ht);
+	reltype = ts_classify_relation(root, rel, &ht);
 
 	/* Check for unexpanded hypertable */
 	if (!rte->inh && ts_rte_is_marked_for_expansion(rte))
@@ -1233,7 +1233,7 @@ timescaledb_get_relation_info_hook(PlannerInfo *root, Oid relation_objectid, boo
 	if (!valid_hook_call())
 		return;
 
-	switch (classify_relation(root, rel, &ht))
+	switch (ts_classify_relation(root, rel, &ht))
 	{
 		case TS_REL_HYPERTABLE:
 		{
@@ -1352,7 +1352,7 @@ involves_hypertable(PlannerInfo *root, RelOptInfo *rel)
 		return join_involves_hypertable(root, rel);
 
 	Hypertable *ht;
-	return classify_relation(root, rel, &ht) == TS_REL_HYPERTABLE;
+	return ts_classify_relation(root, rel, &ht) == TS_REL_HYPERTABLE;
 }
 
 /*
@@ -1475,7 +1475,7 @@ timescaledb_create_upper_paths_hook(PlannerInfo *root, UpperRelationKind stage,
 		return;
 
 	if (input_rel != NULL)
-		reltype = classify_relation(root, input_rel, &ht);
+		reltype = ts_classify_relation(root, input_rel, &ht);
 
 	if (ts_cm_functions->create_upper_paths_hook != NULL)
 		ts_cm_functions
