@@ -700,12 +700,7 @@ get_compressed_chunk_index(ResultRelInfo *resultRelInfo, CompressionSettings *se
 		if (!matches)
 			continue;
 
-		/* Check last index column is sequence number */
-		const char *attname =
-			get_attname(index_relation->rd_id, index_info->ii_NumIndexKeyAttrs, false);
-
-		if (strncmp(attname, COMPRESSION_COLUMN_METADATA_SEQUENCE_NUM_NAME, NAMEDATALEN) == 0)
-			return index_relation->rd_id;
+		return index_relation->rd_id;
 	}
 
 	return InvalidOid;

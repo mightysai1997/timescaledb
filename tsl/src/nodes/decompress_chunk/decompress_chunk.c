@@ -79,73 +79,6 @@ is_compressed_column(CompressionInfo *info, Oid type)
 	return type == info->compresseddata_oid;
 }
 
-static EquivalenceClass *
-append_ec_for_seqnum(PlannerInfo *root, CompressionInfo *info, SortInfo *sort_info, Var *var,
-					 Oid sortop, bool nulls_first)
-{
-	MemoryContext oldcontext = MemoryContextSwitchTo(root->planner_cxt);
-
-	Oid opfamily, opcintype, equality_op;
-	int16 strategy;
-	List *opfamilies;
-	EquivalenceClass *newec = makeNode(EquivalenceClass);
-	EquivalenceMember *em = makeNode(EquivalenceMember);
-
-	/* Find the operator in pg_amop --- failure shouldn't happen */
-	if (!get_ordering_op_properties(sortop, &opfamily, &opcintype, &strategy))
-		elog(ERROR, "operator %u is not a valid ordering operator", sortop);
-
-	/*
-	 * EquivalenceClasses need to contain opfamily lists based on the family
-	 * membership of mergejoinable equality operators, which could belong to
-	 * more than one opfamily.  So we have to look up the opfamily's equality
-	 * operator and get its membership.
-	 */
-	equality_op = get_opfamily_member(opfamily, opcintype, opcintype, BTEqualStrategyNumber);
-	if (!OidIsValid(equality_op)) /* shouldn't happen */
-		elog(ERROR,
-			 "missing operator %d(%u,%u) in opfamily %u",
-			 BTEqualStrategyNumber,
-			 opcintype,
-			 opcintype,
-			 opfamily);
-	opfamilies = get_mergejoin_opfamilies(equality_op);
-	if (!opfamilies) /* certainly should find some */
-		elog(ERROR, "could not find opfamilies for equality operator %u", equality_op);
-
-	em->em_expr = (Expr *) var;
-	em->em_relids = bms_make_singleton(info->compressed_rel->relid);
-#if PG16_LT
-	em->em_nullable_relids = NULL;
-#endif
-	em->em_is_const = false;
-	em->em_is_child = false;
-	em->em_datatype = INT4OID;
-
-	newec->ec_opfamilies = list_copy(opfamilies);
-	newec->ec_collation = 0;
-	newec->ec_members = list_make1(em);
-	newec->ec_sources = NIL;
-	newec->ec_derives = NIL;
-	newec->ec_relids = bms_make_singleton(info->compressed_rel->relid);
-	newec->ec_has_const = false;
-	newec->ec_has_volatile = false;
-#if PG16_LT
-	newec->ec_below_outer_join = false;
-#endif
-	newec->ec_broken = false;
-	newec->ec_sortref = 0;
-	newec->ec_min_security = UINT_MAX;
-	newec->ec_max_security = 0;
-	newec->ec_merged = NULL;
-
-	root->eq_classes = lappend(root->eq_classes, newec);
-
-	MemoryContextSwitchTo(oldcontext);
-
-	return newec;
-}
-
 static void
 build_compressed_scan_pathkeys(SortInfo *sort_info, PlannerInfo *root, List *chunk_pathkeys,
 							   CompressionInfo *info)
@@ -153,6 +86,7 @@ build_compressed_scan_pathkeys(SortInfo *sort_info, PlannerInfo *root, List *chu
 	Var *var;
 	int varattno;
 	List *required_compressed_pathkeys = NIL;
+	ListCell *lc = NULL;
 	PathKey *pk;
 
 	/*
@@ -171,7 +105,6 @@ build_compressed_scan_pathkeys(SortInfo *sort_info, PlannerInfo *root, List *chu
 		 * segmentby columns in the end.
 		 */
 		Bitmapset *segmentby_columns = bms_copy(info->chunk_const_segmentby);
-		ListCell *lc;
 		for (lc = list_head(chunk_pathkeys);
 			 lc != NULL && bms_num_members(segmentby_columns) < info->num_segmentby_columns;
 			 lc = lnext(chunk_pathkeys, lc))
@@ -218,39 +151,62 @@ build_compressed_scan_pathkeys(SortInfo *sort_info, PlannerInfo *root, List *chu
 	 */
 	if (sort_info->needs_sequence_num)
 	{
-		bool nulls_first;
-		Oid sortop;
-		varattno =
-			get_attnum(info->compressed_rte->relid, COMPRESSION_COLUMN_METADATA_SEQUENCE_NUM_NAME);
-		var = makeVar(info->compressed_rel->relid, varattno, INT4OID, -1, InvalidOid, 0);
-
-		if (sort_info->reverse)
+		/* If there are no segmentby pathkeys, start from the beginning of the list */
+		if (info->num_segmentby_columns == 0)
 		{
-			sortop = get_commutator(Int4LessOperator);
-			nulls_first = true;
+			lc = list_head(chunk_pathkeys);
 		}
-		else
+		Assert(lc != NULL);
+		Expr *expr;
+		char *column_name;
+		for (; lc != NULL; lc = lnext(chunk_pathkeys, lc))
 		{
-			sortop = Int4LessOperator;
-			nulls_first = false;
+			pk = lfirst(lc);
+			expr = find_em_expr_for_rel(pk->pk_eclass, info->chunk_rel);
+
+			Assert(expr != NULL && IsA(expr, Var));
+			var = castNode(Var, expr);
+			Assert(var->varattno > 0);
+
+			column_name = get_attname(info->chunk_rte->relid, var->varattno, false);
+			int16 orderby_index = ts_array_position(info->settings->fd.orderby, column_name);
+			varattno = get_attnum(info->compressed_rte->relid, column_segment_min_name(orderby_index));
+			Assert(orderby_index != 0);
+			var = makeVar(info->compressed_rel->relid, varattno, var->vartype, var->vartypmod, var->varcollid, var->varlevelsup);
+			bool orderby_desc =
+				ts_array_get_element_bool(info->settings->fd.orderby_desc, orderby_index);
+			bool orderby_nullsfirst =
+				ts_array_get_element_bool(info->settings->fd.orderby_nullsfirst, orderby_index);
+
+			bool nulls_first;
+			int16 strategy;
+
+			if (sort_info->reverse)
+			{
+				strategy = orderby_desc ? BTLessStrategyNumber : BTGreaterStrategyNumber;
+				nulls_first = !orderby_nullsfirst;
+			}
+			else
+			{
+				strategy = orderby_desc ? BTGreaterStrategyNumber : BTLessStrategyNumber;
+				nulls_first = orderby_nullsfirst;
+			}
+			MemoryContext oldcontext = MemoryContextSwitchTo(root->planner_cxt);
+			EquivalenceMember *em = makeNode(EquivalenceMember);
+
+			em->em_expr = (Expr *)var;
+			em->em_relids = bms_make_singleton(info->compressed_rte->relid);
+			em->em_is_const = false;
+			em->em_is_child = false;
+			em->em_datatype = var->vartype;
+			pk->pk_eclass->ec_members = lappend(pk->pk_eclass->ec_members, em);
+			MemoryContextSwitchTo(oldcontext);
+
+			pk =
+				make_canonical_pathkey(root, pk->pk_eclass, pk->pk_opfamily, strategy, nulls_first);
+
+			required_compressed_pathkeys = lappend(required_compressed_pathkeys, pk);
 		}
-
-		/*
-		 * Create the EquivalenceClass for the sequence number column of this
-		 * compressed chunk, so that we can build the PathKey that refers to it.
-		 */
-		EquivalenceClass *ec =
-			append_ec_for_seqnum(root, info, sort_info, var, sortop, nulls_first);
-
-		/* Find the operator in pg_amop --- failure shouldn't happen. */
-		Oid opfamily, opcintype;
-		int16 strategy;
-		if (!get_ordering_op_properties(sortop, &opfamily, &opcintype, &strategy))
-			elog(ERROR, "operator %u is not a valid ordering operator", sortop);
-
-		pk = make_canonical_pathkey(root, ec, opfamily, strategy, nulls_first);
-
-		required_compressed_pathkeys = lappend(required_compressed_pathkeys, pk);
 	}
 	sort_info->required_compressed_pathkeys = required_compressed_pathkeys;
 }

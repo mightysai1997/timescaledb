@@ -28,6 +28,7 @@
 
 #include "extension_constants.h"
 #include "custom_type_cache.h"
+#include "ts_catalog/array_utils.h"
 #include "ts_catalog/catalog.h"
 #include "ts_catalog/compression_settings.h"
 #include "compression_storage.h"
@@ -278,10 +279,7 @@ create_compressed_chunk_indexes(Chunk *chunk, CompressionSettings *settings)
 		.relation = makeRangeVar(NameStr(chunk->fd.schema_name), NameStr(chunk->fd.table_name), 0),
 		.tableSpace = get_tablespace_name(get_rel_tablespace(chunk->table_id)),
 	};
-	IndexElem sequence_num_elem = {
-		.type = T_IndexElem,
-		.name = COMPRESSION_COLUMN_METADATA_SEQUENCE_NUM_NAME,
-	};
+
 	NameData index_name;
 	ObjectAddress index_addr;
 	HeapTuple index_tuple;
@@ -309,8 +307,47 @@ create_compressed_chunk_indexes(Chunk *chunk, CompressionSettings *settings)
 		return;
 	}
 
-	appendStringInfoString(buf, COMPRESSION_COLUMN_METADATA_SEQUENCE_NUM_NAME);
-	indexcols = lappend(indexcols, &sequence_num_elem);
+	SortByDir ordering;
+	SortByNulls nulls_ordering;
+	
+
+	for (int i = 1; i <= ts_array_length(settings->fd.orderby); i++)
+	{
+		IndexElem *orderby_elem = makeNode(IndexElem);
+		orderby_elem->name = column_segment_min_name(i);
+		appendStringInfoString(buf, orderby_elem->name);
+		if (ts_array_get_element_bool(settings->fd.orderby_desc, i))
+		{
+		    appendStringInfoString(buf, " DESC");
+			ordering = SORTBY_DESC;
+		} else {
+		    appendStringInfoString(buf, " ASC");
+			ordering = SORTBY_ASC;
+		}
+		orderby_elem->ordering = ordering;
+
+		if (ts_array_get_element_bool(settings->fd.orderby_nullsfirst, i))
+		{
+			if (orderby_elem->ordering != SORTBY_DESC)
+			{
+				appendStringInfoString(buf, " NULLS FIRST");
+				nulls_ordering = SORTBY_NULLS_FIRST;
+			} else {
+				nulls_ordering = SORTBY_NULLS_DEFAULT;
+			}
+		} else {
+			if (orderby_elem->ordering != SORTBY_DESC)
+			{
+				nulls_ordering = SORTBY_NULLS_DEFAULT;
+			} else {
+				appendStringInfoString(buf, " NULLS LAST");
+				nulls_ordering = SORTBY_NULLS_LAST;
+			}
+		}
+		orderby_elem->nulls_ordering = nulls_ordering;
+		appendStringInfoString(buf, ", ");
+		indexcols = lappend(indexcols, orderby_elem);
+	}
 
 	stmt.indexParams = indexcols;
 	index_addr = DefineIndexCompat(chunk->table_id,

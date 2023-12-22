@@ -1348,8 +1348,8 @@ SELECT compress_chunk(c) FROM show_chunks('t6367') c;
 SELECT format('%I.%I', schema_name, table_name) AS "CHUNK1" FROM _timescaledb_catalog.chunk WHERE hypertable_id = 2 ORDER BY id LIMIT 1 \gset
 SELECT format('%I.%I', schema_name, table_name) AS "CHUNK2" FROM _timescaledb_catalog.chunk WHERE hypertable_id = 2 ORDER BY id LIMIT 1 OFFSET 1 \gset
 
-DROP INDEX _timescaledb_internal.compress_hyper_2_3_chunk_source_id_label__ts_meta_sequence__idx;
-DROP INDEX _timescaledb_internal.compress_hyper_2_4_chunk_source_id_label__ts_meta_sequence__idx;
+DROP INDEX _timescaledb_internal.compress_hyper_2_3_chunk_source_id_label__ts_meta_min_1_idx;
+DROP INDEX _timescaledb_internal.compress_hyper_2_4_chunk_source_id_label__ts_meta_min_1_idx;
 -- testcase with no index, should use seq scan
 set timescaledb.debug_compression_path_info to on;
 BEGIN;
