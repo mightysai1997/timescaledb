@@ -2,15 +2,6 @@
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-TIMESCALE for a copy of the license.
 
--- In the following test cases, we test that certain indexes are used. By using the
--- timescaledb.enable_decompression_sorted_merge optimization, we are pushing a sort node
--- below the DecompressChunk node, which operates on the batches. This could lead to flaky
--- tests because the input data is small and PostgreSQL switches from IndexScans to
--- SequentialScans. Disable the optimization for the following tests to ensure we have
--- stable query plans in all CI environments.
-
-SET timescaledb.enable_decompression_sorted_merge = 0;
-
 -- test LATERAL with ordered append in the outer query
 :PREFIX
 SELECT time,
@@ -127,6 +118,7 @@ FROM :TEST_TABLE o1
 WHERE o1.time < '2000-02-01'
   AND o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o1.time;
 
 RESET enable_nestloop;
@@ -175,6 +167,7 @@ FROM :TEST_TABLE o1
   INNER JOIN :TEST_TABLE o2 ON o1.time = o2.time
 WHERE o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o1.time
 LIMIT 100;
 
@@ -186,6 +179,7 @@ FROM :TEST_TABLE o1
   INNER JOIN :TEST_TABLE o2 USING (time)
 WHERE o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o1.time
 LIMIT 100;
 
@@ -197,6 +191,7 @@ FROM :TEST_TABLE o1
   NATURAL INNER JOIN :TEST_TABLE o2
 WHERE o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o1.time
 LIMIT 100;
 
@@ -208,6 +203,7 @@ FROM :TEST_TABLE o1
   LEFT JOIN :TEST_TABLE o2 ON o1.time = o2.time
 WHERE o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o1.time
 LIMIT 100;
 
@@ -219,6 +215,7 @@ FROM :TEST_TABLE o1
   RIGHT JOIN :TEST_TABLE o2 ON o1.time = o2.time
 WHERE o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o2.time
 LIMIT 100;
 
@@ -230,6 +227,7 @@ FROM :TEST_TABLE o1
   INNER JOIN :TEST_TABLE o2 ON o2.time = o1.time
 WHERE o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o1.time
 LIMIT 100;
 
@@ -242,6 +240,7 @@ FROM :TEST_TABLE o1
 WHERE o1.time = o2.time
   AND o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o1.time
 LIMIT 100;
 
@@ -253,6 +252,7 @@ FROM :TEST_TABLE o1
   INNER JOIN :TEST_TABLE o2 ON o1.time = o2.time
 WHERE o1.device_id = 1
   AND o2.device_id = 2
+  AND o1.v0 = 2
 ORDER BY o2.time
 LIMIT 100;
 
@@ -261,18 +261,20 @@ LIMIT 100;
 :PREFIX
 SELECT o1.time
 FROM :TEST_TABLE o1
-  INNER JOIN :TEST_TABLE o2 ON o1.device_id = o2.device_id
+INNER JOIN :TEST_TABLE o2 ON o1.device_id = o2.device_id
     AND o1.time = o2.time
-  ORDER BY o1.time
-  LIMIT 100;
+WHERE o1.v0 = 2
+ORDER BY o1.time
+LIMIT 100;
 
 -- test JOIN on device_id
 -- should not use ordered append for 2nd hypertable
 :PREFIX
 SELECT o1.time
 FROM :TEST_TABLE o1
-  INNER JOIN :TEST_TABLE o2 ON o1.device_id = o2.device_id
+INNER JOIN :TEST_TABLE o2 ON o1.device_id = o2.device_id
 WHERE o1.device_id = 1
+  AND o1.v0 = 2
 ORDER BY o1.time
 LIMIT 100;
 
@@ -282,7 +284,8 @@ LIMIT 100;
 SELECT o1.time
 FROM :TEST_TABLE o1,
   :TEST_TABLE o2
-WHERE o1.time = o2.time
+WHERE o1.v0 = 2
+  AND o1.time = o2.time
   AND o1.device_id = 1
   AND o2.device_id = 2
 ORDER BY o1.time
@@ -290,6 +293,8 @@ LIMIT 100;
 
 -- test JOIN on time column with 3 hypertables
 -- should use 3 ChunkAppend
+SET join_collapse_limit TO 1;
+
 :PREFIX
 SELECT o1.time
 FROM :TEST_TABLE o1
@@ -298,7 +303,10 @@ FROM :TEST_TABLE o1
 WHERE o1.device_id = 1
   AND o2.device_id = 2
   AND o3.device_id = 3
+  AND o1.v0 = 2
 ORDER BY o1.time
 LIMIT 100;
+
+RESET join_collapse_limit;
 
 RESET enable_seqscan;
