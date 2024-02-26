@@ -88,9 +88,9 @@ chunk_constraints_expand(ChunkConstraints *ccs, int16 new_capacity)
 }
 
 static void
-chunk_constraint_dimension_choose_name(Name dst, int32 dimension_slice_id)
+chunk_constraint_dimension_choose_name(Name dst, const char *prefix, int32 dimension_slice_id)
 {
-	snprintf(NameStr(*dst), NAMEDATALEN, "constraint_%d", dimension_slice_id);
+	snprintf(NameStr(*dst), NAMEDATALEN, "%sconstraint_%d", prefix, dimension_slice_id);
 }
 
 static void
@@ -115,7 +115,8 @@ chunk_constraint_choose_name(Name dst, const char *hypertable_constraint_name, i
 
 ChunkConstraint *
 ts_chunk_constraints_add(ChunkConstraints *ccs, int32 chunk_id, int32 dimension_slice_id,
-						 const char *constraint_name, const char *hypertable_constraint_name)
+						 const char *constraint_name, const char *hypertable_constraint_name,
+						 char dimension_type)
 {
 	ChunkConstraint *cc;
 
@@ -123,12 +124,35 @@ ts_chunk_constraints_add(ChunkConstraints *ccs, int32 chunk_id, int32 dimension_
 	cc = &ccs->constraints[ccs->num_constraints++];
 	cc->fd.chunk_id = chunk_id;
 	cc->fd.dimension_slice_id = dimension_slice_id;
+	switch (dimension_type)
+	{
+		case FD_DIMENSION_OPEN:
+		case FD_DIMENSION_CLOSED:
+			cc->type = CCONSTR_DIMENSION;
+			break;
+		case FD_DIMENSION_CHECK:
+			cc->type = CCONSTR_CHECK;
+			break;
+		case FD_DIMENSION_CORRELATED:
+			cc->type = CCONSTR_CORRELATED;
+			break;
+		default:
+			/* should not be possible */
+			ereport(ERROR, (errmsg("unexpected dimension type %c", dimension_type)));
+			break;
+	}
 
 	if (NULL == constraint_name)
 	{
-		if (is_dimension_constraint(cc))
+		if (is_dimension_constraint(cc) || is_correlated_constraint(cc))
 		{
+			/*
+			 * for correlated constraints we choose a prefix of "_$CC_" to help
+			 * us identify it on re-reading from the catalog.
+			 */
 			chunk_constraint_dimension_choose_name(&cc->fd.constraint_name,
+												   is_correlated_constraint(cc) ? CC_DIM_PREFIX :
+																				  "",
 												   cc->fd.dimension_slice_id);
 			namestrcpy(&cc->fd.hypertable_constraint_name, "");
 		}
@@ -163,7 +187,7 @@ chunk_constraint_fill_tuple_values(const ChunkConstraint *cc, Datum values[Natts
 	values[AttrNumberGetAttrOffset(Anum_chunk_constraint_hypertable_constraint_name)] =
 		NameGetDatum(&cc->fd.hypertable_constraint_name);
 
-	if (is_dimension_constraint(cc))
+	if (is_dimension_constraint(cc) || is_correlated_constraint(cc))
 		nulls[AttrNumberGetAttrOffset(Anum_chunk_constraint_hypertable_constraint_name)] = true;
 	else
 		nulls[AttrNumberGetAttrOffset(Anum_chunk_constraint_dimension_slice_id)] = true;
@@ -230,6 +254,7 @@ ts_chunk_constraints_add_from_tuple(ChunkConstraints *ccs, const TupleInfo *ti)
 	Name constraint_name;
 	Name hypertable_constraint_name;
 	bool should_free;
+	char dimension_type = FD_DIMENSION_ANY;
 	HeapTuple tuple = ts_scanner_fetch_heap_tuple(ti, false, &should_free);
 	MemoryContext oldcxt;
 
@@ -245,12 +270,22 @@ ts_chunk_constraints_add_from_tuple(ChunkConstraints *ccs, const TupleInfo *ti)
 		dimension_slice_id = 0;
 		hypertable_constraint_name = DatumGetName(
 			values[AttrNumberGetAttrOffset(Anum_chunk_constraint_hypertable_constraint_name)]);
+		dimension_type = FD_DIMENSION_CLOSED;
 	}
 	else
 	{
 		dimension_slice_id = DatumGetInt32(
 			values[AttrNumberGetAttrOffset(Anum_chunk_constraint_dimension_slice_id)]);
 		hypertable_constraint_name = DatumGetName(DirectFunctionCall1(namein, CStringGetDatum("")));
+
+		/* check if it's a correlated constraint, we get the dimension's type for this */
+		ScanIterator slice_iterator =
+			ts_dimension_slice_scan_iterator_create(NULL, CurrentMemoryContext);
+		DimensionSlice *slice = ts_dimension_slice_scan_iterator_get_by_id(&slice_iterator,
+																		   dimension_slice_id,
+																		   /* tuplock = */ NULL);
+		dimension_type = ts_dimension_get_dimension_type(slice->fd.dimension_id);
+		ts_scan_iterator_close(&slice_iterator);
 	}
 
 	constraints = ts_chunk_constraints_add(ccs,
@@ -258,7 +293,8 @@ ts_chunk_constraints_add_from_tuple(ChunkConstraints *ccs, const TupleInfo *ti)
 											   Anum_chunk_constraint_chunk_id)]),
 										   dimension_slice_id,
 										   NameStr(*constraint_name),
-										   NameStr(*hypertable_constraint_name));
+										   NameStr(*hypertable_constraint_name),
+										   dimension_type);
 
 	MemoryContextSwitchTo(oldcxt);
 
@@ -492,7 +528,7 @@ ts_chunk_constraints_create(const Hypertable *ht, const Chunk *chunk)
 			if (constr != NULL)
 				newconstrs = lappend(newconstrs, constr);
 		}
-		else
+		else if (!is_correlated_constraint(cc))
 		{
 			create_non_dimensional_constraint(cc,
 											  chunk->table_id,
@@ -781,7 +817,12 @@ ts_chunk_constraints_add_dimension_constraints(ChunkConstraints *ccs, int32 chun
 	int i;
 
 	for (i = 0; i < cube->num_slices; i++)
-		ts_chunk_constraints_add(ccs, chunk_id, cube->slices[i]->fd.id, NULL, NULL);
+		ts_chunk_constraints_add(ccs,
+								 chunk_id,
+								 cube->slices[i]->fd.id,
+								 NULL,
+								 NULL,
+								 FD_DIMENSION_OPEN);
 
 	return cube->num_slices;
 }
@@ -802,7 +843,12 @@ chunk_constraint_add(HeapTuple constraint_tuple, void *arg)
 
 	if (chunk_constraint_need_on_chunk(cc->chunk_relkind, constraint))
 	{
-		ts_chunk_constraints_add(cc->ccs, cc->chunk_id, 0, NULL, NameStr(constraint->conname));
+		ts_chunk_constraints_add(cc->ccs,
+								 cc->chunk_id,
+								 0,
+								 NULL,
+								 NameStr(constraint->conname),
+								 FD_DIMENSION_CHECK);
 		return CONSTR_PROCESSED;
 	}
 
@@ -835,7 +881,8 @@ chunk_constraint_add_check(HeapTuple constraint_tuple, void *arg)
 								 cc->chunk_id,
 								 0,
 								 NameStr(constraint->conname),
-								 NameStr(constraint->conname));
+								 NameStr(constraint->conname),
+								 FD_DIMENSION_CHECK);
 		return CONSTR_PROCESSED;
 	}
 
@@ -874,7 +921,8 @@ ts_chunk_constraint_create_on_chunk(const Hypertable *ht, const Chunk *chunk, Oi
 													   chunk->fd.id,
 													   0,
 													   NULL,
-													   NameStr(con->conname));
+													   NameStr(con->conname),
+													   FD_DIMENSION_CHECK);
 
 		ts_chunk_constraint_insert(cc);
 		create_non_dimensional_constraint(cc,
@@ -1180,7 +1228,8 @@ ts_chunk_constraint_adjust_meta(int32 chunk_id, const char *ht_constraint_name,
 }
 
 bool
-ts_chunk_constraint_update_slice_id(int32 chunk_id, int32 old_slice_id, int32 new_slice_id)
+ts_chunk_constraint_update_slice_id_name(int32 chunk_id, int32 old_slice_id, int32 new_slice_id,
+										 const char *new_name)
 {
 	ScanIterator iterator =
 		ts_scan_iterator_create(CHUNK_CONSTRAINT, RowExclusiveLock, CurrentMemoryContext);
@@ -1208,6 +1257,16 @@ ts_chunk_constraint_update_slice_id(int32 chunk_id, int32 old_slice_id, int32 ne
 		values[AttrNumberGetAttrOffset(Anum_chunk_constraint_dimension_slice_id)] =
 			Int32GetDatum(new_slice_id);
 		repl[AttrNumberGetAttrOffset(Anum_chunk_constraint_dimension_slice_id)] = true;
+
+		if (new_name != NULL)
+		{
+			NameData new_namedata;
+
+			namestrcpy(&new_namedata, new_name);
+			values[AttrNumberGetAttrOffset(Anum_chunk_constraint_constraint_name)] =
+				NameGetDatum(&new_namedata);
+			repl[AttrNumberGetAttrOffset(Anum_chunk_constraint_constraint_name)] = true;
+		}
 
 		new_tuple =
 			heap_modify_tuple(tuple, ts_scanner_get_tupledesc(ti), values, replIsnull, repl);

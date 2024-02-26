@@ -3093,7 +3093,7 @@ process_alter_column_type_end(Hypertable *ht, AlterTableCmd *cmd)
 	if (NULL == dim)
 		return;
 
-	ts_dimension_set_type(dim, new_type);
+	ts_dimension_set_column_type(dim, new_type);
 	ts_process_utility_set_expect_chunk_modification(true);
 	ts_chunk_recreate_all_constraints_for_dimension(ht, dim->fd.id);
 	ts_process_utility_set_expect_chunk_modification(false);
