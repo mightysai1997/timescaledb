@@ -81,6 +81,8 @@ typedef struct DecompressContext
 	PlanState *ps; /* Set for filtering and instrumentation */
 
 	Detoaster detoaster;
+
+	TupleTableSlotOps tts_ops;
 } DecompressContext;
 
 #endif /* TIMESCALEDB_DECOMPRESS_CONTEXT_H */

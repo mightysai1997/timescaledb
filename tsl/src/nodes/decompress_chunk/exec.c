@@ -173,6 +173,27 @@ decompress_chunk_exec_heap(CustomScanState *node)
 	return decompress_chunk_exec_impl(chunk_state, &BatchQueueFunctionsHeap);
 }
 
+static int
+compressed_column_cmp(const void *_left, const void *_right)
+{
+	const CompressionColumnDescription *left = (const CompressionColumnDescription *) _left;
+	const CompressionColumnDescription *right = (const CompressionColumnDescription *) _right;
+
+	Assert(left->type == COMPRESSED_COLUMN);
+	Assert(right->type == COMPRESSED_COLUMN);
+
+	if (left->output_attno < right->output_attno)
+	{
+		return -1;
+	}
+
+	if (left->output_attno > right->output_attno)
+	{
+		return 1;
+	}
+
+	return 0;
+}
 /*
  * Complete initialization of the supplied CustomScanState.
  *
@@ -188,7 +209,16 @@ decompress_chunk_begin(CustomScanState *node, EState *estate, int eflags)
 	Plan *compressed_scan = linitial(cscan->custom_plans);
 	Assert(list_length(cscan->custom_plans) == 1);
 
+	dcontext->decompressed_slot = node->ss.ss_ScanTupleSlot;
+
 	PlanState *ps = &node->ss.ps;
+
+	ps->scanopsfixed = false;
+	ps->resultopsfixed = false;
+
+	/* initialize child expressions */
+	ps->qual = ExecInitQual(cscan->scan.plan.qual, ps);
+
 	if (ps->ps_ProjInfo)
 	{
 		/*
@@ -204,15 +234,11 @@ decompress_chunk_begin(CustomScanState *node, EState *estate, int eflags)
 		List *modified_tlist =
 			constify_tableoid(tlist, cscan->scan.scanrelid, chunk_state->chunk_relid);
 
-		if (modified_tlist != tlist)
-		{
-			ps->ps_ProjInfo =
-				ExecBuildProjectionInfo(modified_tlist,
-										ps->ps_ExprContext,
-										ps->ps_ResultTupleSlot,
-										ps,
-										node->ss.ss_ScanTupleSlot->tts_tupleDescriptor);
-		}
+		ps->ps_ProjInfo = ExecBuildProjectionInfo(modified_tlist,
+												  ps->ps_ExprContext,
+												  ps->ps_ResultTupleSlot,
+												  ps,
+												  node->ss.ss_ScanTupleSlot->tts_tupleDescriptor);
 	}
 	/* Sort keys should only be present when sorted_merge_append is used */
 	Assert(dcontext->batch_sorted_merge == true || list_length(chunk_state->sortinfo) == 0);
@@ -262,7 +288,6 @@ decompress_chunk_begin(CustomScanState *node, EState *estate, int eflags)
 	dcontext->num_compressed_columns = num_compressed;
 	dcontext->num_total_columns = num_total;
 	dcontext->template_columns = palloc0(sizeof(CompressionColumnDescription) * num_total);
-	dcontext->decompressed_slot = node->ss.ss_ScanTupleSlot;
 	dcontext->ps = &node->ss.ps;
 
 	TupleDesc desc = dcontext->decompressed_slot->tts_tupleDescriptor;
@@ -345,6 +370,10 @@ decompress_chunk_begin(CustomScanState *node, EState *estate, int eflags)
 	Assert(current_compressed == num_compressed);
 	Assert(current_not_compressed == num_total);
 
+	qsort(dcontext->template_columns,
+		  num_compressed,
+		  sizeof(*dcontext->template_columns),
+		  compressed_column_cmp);
 	/*
 	 * Choose which batch queue we are going to use: heap for batch sorted
 	 * merge, and one-element FIFO for normal decompression.
