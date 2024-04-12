@@ -152,19 +152,45 @@ hyperspace_get_num_dimensions_by_type(Hyperspace *hs, DimensionType type)
 }
 
 static inline DimensionType
-dimension_type(TupleInfo *ti)
+get_dimension_type(char dimension_type)
 {
-	if (slot_attisnull(ti->slot, Anum_dimension_interval_length) &&
-		!slot_attisnull(ti->slot, Anum_dimension_num_slices))
-		return DIMENSION_TYPE_CLOSED;
+	switch (dimension_type)
+	{
+		case FD_DIMENSION_OPEN:
+			return DIMENSION_TYPE_OPEN;
+		case FD_DIMENSION_CLOSED:
+			return DIMENSION_TYPE_CLOSED;
+		case FD_DIMENSION_CORRELATED:
+			return DIMENSION_TYPE_CORRELATED;
+		default:
+			/* should not be possible */
+			ereport(ERROR, (errmsg("unexpected dimension type %c", dimension_type)));
+			break;
+	}
 
-	if (!slot_attisnull(ti->slot, Anum_dimension_interval_length) &&
-		slot_attisnull(ti->slot, Anum_dimension_num_slices))
-		return DIMENSION_TYPE_OPEN;
-
-	elog(ERROR, "invalid partitioning dimension");
 	/* suppress compiler warning on MSVC */
 	return DIMENSION_TYPE_ANY;
+}
+
+static inline char
+get_dimension_char_type(DimensionType dimension_type)
+{
+	switch (dimension_type)
+	{
+		case DIMENSION_TYPE_OPEN:
+			return FD_DIMENSION_OPEN;
+		case DIMENSION_TYPE_CLOSED:
+			return FD_DIMENSION_CLOSED;
+		case DIMENSION_TYPE_CORRELATED:
+			return FD_DIMENSION_CORRELATED;
+		default:
+			/* should not be possible */
+			ereport(ERROR, (errmsg("unexpected dimension type %d", dimension_type)));
+			break;
+	}
+
+	/* suppress compiler warning on MSVC */
+	return FD_DIMENSION_ANY;
 }
 
 static void
@@ -181,7 +207,6 @@ dimension_fill_in_from_tuple(Dimension *d, TupleInfo *ti, Oid main_table_relid)
 	 */
 	heap_deform_tuple(tuple, ts_scanner_get_tupledesc(ti), values, isnull);
 
-	d->type = dimension_type(ti);
 	d->fd.id = DatumGetInt32(values[AttrNumberGetAttrOffset(Anum_dimension_id)]);
 	d->fd.hypertable_id =
 		DatumGetInt32(values[AttrNumberGetAttrOffset(Anum_dimension_hypertable_id)]);
@@ -190,6 +215,8 @@ dimension_fill_in_from_tuple(Dimension *d, TupleInfo *ti, Oid main_table_relid)
 		DatumGetObjectId(values[AttrNumberGetAttrOffset(Anum_dimension_column_type)]);
 	namestrcpy(&d->fd.column_name,
 			   DatumGetCString(values[AttrNumberGetAttrOffset(Anum_dimension_column_name)]));
+	d->fd.type = DatumGetChar(values[AttrNumberGetAttrOffset(Anum_dimension_type)]);
+	d->type = get_dimension_type(d->fd.type);
 
 	if (!isnull[AttrNumberGetAttrOffset(Anum_dimension_partitioning_func_schema)] &&
 		!isnull[AttrNumberGetAttrOffset(Anum_dimension_partitioning_func)])
@@ -564,6 +591,49 @@ dimension_scan_internal(ScanKeyData *scankey, int nkeys, tuple_found_func tuple_
 	return ts_scanner_scan(&scanctx);
 }
 
+/*
+ * Check if there are any correlated constraint entries and if yes create
+ * two new structures in the hypertable
+ */
+void
+ts_correlated_constraints_assign(Hypertable *h, MemoryContext mctx)
+{
+	int i;
+	int num_corr_cons = 0;
+	Hyperspace *hs = h->space, *sec_hs = NULL, *new_hs = NULL;
+
+	for (i = 0; i < hs->num_dimensions; i++)
+	{
+		Dimension *dim = &hs->dimensions[i];
+
+		if (IS_CORRELATED_DIMENSION(dim))
+			num_corr_cons++;
+	}
+
+	if (num_corr_cons == 0)
+		return;
+
+	Assert(num_corr_cons < hs->num_dimensions);
+	sec_hs = hyperspace_create(hs->hypertable_id, hs->main_table_relid, num_corr_cons, mctx);
+	new_hs = hyperspace_create(hs->hypertable_id,
+							   hs->main_table_relid,
+							   hs->num_dimensions - num_corr_cons,
+							   mctx);
+
+	for (i = 0; i < hs->num_dimensions; i++)
+	{
+		Dimension *dim = &hs->dimensions[i];
+
+		if (IS_CORRELATED_DIMENSION(dim))
+			sec_hs->dimensions[sec_hs->num_dimensions++] = *dim;
+		else
+			new_hs->dimensions[new_hs->num_dimensions++] = *dim;
+	}
+	pfree(h->space);
+	h->space = new_hs;
+	h->correlated_space = sec_hs;
+}
+
 Hyperspace *
 ts_dimension_scan(int32 hypertable_id, Oid main_table_relid, int16 num_dimensions,
 				  MemoryContext mctx)
@@ -633,6 +703,49 @@ ts_dimension_get_hypertable_id(int32 dimension_id)
 		return hypertable_id;
 
 	return -1;
+}
+
+static ScanTupleResult
+dimension_find_dimension_type_tuple_found(TupleInfo *ti, void *data)
+{
+	char *dimension_type = data;
+	bool isnull = false;
+	Datum datum = slot_getattr(ti->slot, Anum_dimension_type, &isnull);
+
+	Assert(!isnull);
+	*dimension_type = DatumGetChar(datum);
+
+	return SCAN_DONE;
+}
+
+char
+ts_dimension_get_dimension_type(int32 dimension_id)
+{
+	char dimension_type = FD_DIMENSION_ANY;
+	ScanKeyData scankey[1];
+
+	/* Perform an index scan dimension_id. */
+	ScanKeyInit(&scankey[0],
+				Anum_dimension_id_idx_id,
+				BTEqualStrategyNumber,
+				F_INT4EQ,
+				Int32GetDatum(dimension_id));
+
+	dimension_scan_internal(scankey,
+							1,
+							dimension_find_dimension_type_tuple_found,
+							&dimension_type,
+							1,
+							DIMENSION_ID_IDX,
+							AccessShareLock,
+							CurrentMemoryContext);
+
+	/* should never get a type of FD_DIMENSION_ANY */
+	if (dimension_type == FD_DIMENSION_ANY)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("got invalid type \"%c\" for dimension %d", dimension_type, dimension_id)));
+	return dimension_type;
 }
 
 DimensionVec *
@@ -782,13 +895,15 @@ dimension_tuple_update(TupleInfo *ti, void *data)
 
 static int32
 dimension_insert_relation(Relation rel, int32 hypertable_id, Name colname, Oid coltype,
-						  int16 num_slices, regproc partitioning_func, int64 interval_length)
+						  int16 num_slices, regproc partitioning_func, int64 interval_length,
+						  DimensionType dim_type)
 {
 	TupleDesc desc = RelationGetDescr(rel);
 	Datum values[Natts_dimension];
 	bool nulls[Natts_dimension] = { false };
 	CatalogSecurityContext sec_ctx;
 	int32 dimension_id;
+	char dimension_type = FD_DIMENSION_ANY;
 
 	values[AttrNumberGetAttrOffset(Anum_dimension_hypertable_id)] = Int32GetDatum(hypertable_id);
 	values[AttrNumberGetAttrOffset(Anum_dimension_column_name)] = NameGetDatum(colname);
@@ -816,15 +931,19 @@ dimension_insert_relation(Relation rel, int32 hypertable_id, Name colname, Oid c
 		values[AttrNumberGetAttrOffset(Anum_dimension_num_slices)] = Int16GetDatum(num_slices);
 		values[AttrNumberGetAttrOffset(Anum_dimension_aligned)] = BoolGetDatum(false);
 		nulls[AttrNumberGetAttrOffset(Anum_dimension_interval_length)] = true;
+		Assert(dim_type == DIMENSION_TYPE_CLOSED);
+		dimension_type = FD_DIMENSION_CLOSED;
 	}
 	else
 	{
 		/* Open (time) dimension */
-		Assert(num_slices <= 0 && interval_length > 0);
+		Assert(dim_type == DIMENSION_TYPE_CORRELATED || (num_slices <= 0 && interval_length > 0));
 		values[AttrNumberGetAttrOffset(Anum_dimension_interval_length)] =
 			Int64GetDatum(interval_length);
 		values[AttrNumberGetAttrOffset(Anum_dimension_aligned)] = BoolGetDatum(true);
 		nulls[AttrNumberGetAttrOffset(Anum_dimension_num_slices)] = true;
+		dimension_type =
+			(dim_type == DIMENSION_TYPE_CORRELATED) ? FD_DIMENSION_CORRELATED : FD_DIMENSION_OPEN;
 	}
 
 	/* no integer_now function by default */
@@ -833,6 +952,9 @@ dimension_insert_relation(Relation rel, int32 hypertable_id, Name colname, Oid c
 
 	/* no compress interval length by default */
 	nulls[AttrNumberGetAttrOffset(Anum_dimension_compress_interval_length)] = true;
+
+	Assert(dimension_type != FD_DIMENSION_ANY);
+	values[AttrNumberGetAttrOffset(Anum_dimension_type)] = CharGetDatum(dimension_type);
 
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 	dimension_id = Int32GetDatum(ts_catalog_table_next_seq_id(ts_catalog_get(), DIMENSION));
@@ -845,7 +967,7 @@ dimension_insert_relation(Relation rel, int32 hypertable_id, Name colname, Oid c
 
 static int32
 dimension_insert(int32 hypertable_id, Name colname, Oid coltype, int16 num_slices,
-				 regproc partitioning_func, int64 interval_length)
+				 regproc partitioning_func, int64 interval_length, DimensionType dim_type)
 {
 	Catalog *catalog = ts_catalog_get();
 	Relation rel;
@@ -858,13 +980,14 @@ dimension_insert(int32 hypertable_id, Name colname, Oid coltype, int16 num_slice
 											 coltype,
 											 num_slices,
 											 partitioning_func,
-											 interval_length);
+											 interval_length,
+											 dim_type);
 	table_close(rel, RowExclusiveLock);
 	return dimension_id;
 }
 
 int
-ts_dimension_set_type(Dimension *dim, Oid newtype)
+ts_dimension_set_column_type(Dimension *dim, Oid newtype)
 {
 	if (!IS_VALID_OPEN_DIM_TYPE(newtype))
 		ereport(ERROR,
@@ -989,6 +1112,7 @@ ts_hyperspace_calculate_point(const Hyperspace *hs, TupleTableSlot *slot)
 			case DIMENSION_TYPE_CLOSED:
 				p->coordinates[p->num_coords++] = (int64) DatumGetInt32(datum);
 				break;
+			case DIMENSION_TYPE_CORRELATED:
 			case DIMENSION_TYPE_ANY:
 				elog(ERROR, "invalid dimension type when inserting tuple");
 				break;
@@ -1342,7 +1466,7 @@ dimension_info_validate_open(DimensionInfo *info)
 {
 	Oid dimtype = info->coltype;
 
-	Assert(info->type == DIMENSION_TYPE_OPEN);
+	Assert(info->type == DIMENSION_TYPE_OPEN || info->type == DIMENSION_TYPE_CORRELATED);
 
 	if (OidIsValid(info->partitioning_func))
 	{
@@ -1469,6 +1593,7 @@ ts_dimension_info_validate(DimensionInfo *info)
 			dimension_info_validate_closed(info);
 			break;
 		case DIMENSION_TYPE_OPEN:
+		case DIMENSION_TYPE_CORRELATED: /* needs same initial validation as open dims */
 			dimension_info_validate_open(info);
 			break;
 		case DIMENSION_TYPE_ANY:
@@ -1490,7 +1615,8 @@ ts_dimension_add_from_info(DimensionInfo *info)
 										  info->coltype,
 										  info->num_slices,
 										  info->partitioning_func,
-										  info->interval);
+										  info->interval,
+										  info->type);
 
 	return info->dimension_id;
 }
@@ -1553,6 +1679,7 @@ dimension_create_datum(FunctionCallInfo fcinfo, DimensionInfo *info, bool is_gen
  * 3. Interval for open ('time') dimensions
  * 4. Partitioning function
  * 5. IF NOT EXISTS option (bool)
+ * 6. Is it a correlated constraint? (bool)
  */
 static Datum
 ts_dimension_add_internal(FunctionCallInfo fcinfo, DimensionInfo *info, bool is_generic)
@@ -1584,6 +1711,18 @@ ts_dimension_add_internal(FunctionCallInfo fcinfo, DimensionInfo *info, bool is_
 	DEBUG_WAITPOINT("add_dimension_ht_lock");
 
 	info->ht = ts_hypertable_cache_get_cache_and_entry(info->table_relid, CACHE_FLAG_NONE, &hcache);
+
+	/* for correlated constraints the type is INT8OID */
+	if (info->type == DIMENSION_TYPE_CORRELATED)
+	{
+		if (OidIsValid(info->interval_type))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("interval type cannot be specified for correlated constraints")));
+
+		info->interval_type = INT8OID;
+		info->interval_datum = Int64GetDatum(1);
+	}
 
 	if (info->num_slices_is_set && OidIsValid(info->interval_type))
 		ereport(ERROR,
@@ -1646,7 +1785,8 @@ ts_dimension_add_internal(FunctionCallInfo fcinfo, DimensionInfo *info, bool is_
 															   chunk->fd.id,
 															   slice->fd.id,
 															   NULL,
-															   NULL);
+															   NULL,
+															   get_dimension_char_type(info->type));
 				ts_chunk_constraint_insert(cc);
 			}
 		}
@@ -1674,6 +1814,7 @@ ts_dimension_add(PG_FUNCTION_ARGS)
 		.partitioning_func = PG_ARGISNULL(4) ? InvalidOid : PG_GETARG_OID(4),
 		.if_not_exists = PG_ARGISNULL(5) ? false : PG_GETARG_BOOL(5),
 	};
+	bool correlated = PG_ARGISNULL(6) ? false : PG_GETARG_BOOL(6);
 
 	TS_PREVENT_FUNC_IF_READ_ONLY();
 
@@ -1683,6 +1824,9 @@ ts_dimension_add(PG_FUNCTION_ARGS)
 	if (PG_ARGISNULL(0))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("hypertable cannot be NULL")));
+
+	if (correlated)
+		info.type = DIMENSION_TYPE_CORRELATED;
 
 	return ts_dimension_add_internal(fcinfo, &info, false);
 }
@@ -1735,6 +1879,23 @@ ts_dimension_info_out(PG_FUNCTION_ARGS)
 							 NameStr(info->colname),
 							 argvalstr,
 							 partfuncname);
+			break;
+		}
+
+		case DIMENSION_TYPE_CORRELATED: /* this won't be called via this interface probably */
+		{
+			const char *argvalstr = "-";
+
+			if (OidIsValid(info->interval_type))
+			{
+				bool isvarlena;
+				Oid outfuncid;
+				getTypeOutputInfo(info->interval_type, &outfuncid, &isvarlena);
+				Assert(OidIsValid(outfuncid));
+				argvalstr = OidOutputFunctionCall(outfuncid, info->interval_datum);
+			}
+
+			appendStringInfo(&str, "correlated//%s//%s", NameStr(info->colname), argvalstr);
 			break;
 		}
 

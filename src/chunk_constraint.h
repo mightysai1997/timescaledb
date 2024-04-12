@@ -11,9 +11,20 @@
 #include "ts_catalog/catalog.h"
 #include "hypertable.h"
 
+typedef enum CConstrType /* types of chunk constraints */
+{
+	CCONSTR_NONE,
+	CCONSTR_DIMENSION,
+	CCONSTR_CHECK,
+	CCONSTR_CORRELATED
+} CConstrType;
+
+#define CC_DIM_PREFIX "_$CC_" /* Correlated Constraint dimension prefix */
+
 typedef struct ChunkConstraint
 {
 	FormData_chunk_constraint fd;
+	CConstrType type;
 } ChunkConstraint;
 
 typedef struct ChunkConstraints
@@ -27,7 +38,9 @@ typedef struct ChunkConstraints
 
 #define chunk_constraints_get(cc, i) &((cc)->constraints[i])
 
-#define is_dimension_constraint(cc) ((cc)->fd.dimension_slice_id > 0)
+#define is_dimension_constraint(cc)                                                                \
+	((cc)->fd.dimension_slice_id > 0 && (cc)->type == CCONSTR_DIMENSION)
+#define is_correlated_constraint(cc) ((cc)->type == CCONSTR_CORRELATED)
 
 typedef struct Chunk Chunk;
 typedef struct DimensionSlice DimensionSlice;
@@ -48,7 +61,8 @@ extern int ts_chunk_constraint_scan_by_dimension_slice_id(int32 dimension_slice_
 extern ChunkConstraint *ts_chunk_constraints_add(ChunkConstraints *ccs, int32 chunk_id,
 												 int32 dimension_slice_id,
 												 const char *constraint_name,
-												 const char *hypertable_constraint_name);
+												 const char *hypertable_constraint_name,
+												 char dimension_type);
 extern int ts_chunk_constraints_add_dimension_constraints(ChunkConstraints *ccs, int32 chunk_id,
 														  const Hypercube *cube);
 extern TSDLLEXPORT int ts_chunk_constraints_add_inheritable_constraints(ChunkConstraints *ccs,
@@ -75,8 +89,9 @@ extern int ts_chunk_constraint_rename_hypertable_constraint(int32 chunk_id, cons
 															const char *new_name);
 extern int ts_chunk_constraint_adjust_meta(int32 chunk_id, const char *ht_constraint_name,
 										   const char *old_name, const char *new_name);
-extern TSDLLEXPORT bool ts_chunk_constraint_update_slice_id(int32 chunk_id, int32 old_slice_id,
-															int32 new_slice_id);
+extern TSDLLEXPORT bool ts_chunk_constraint_update_slice_id_name(int32 chunk_id, int32 old_slice_id,
+																 int32 new_slice_id,
+																 const char *new_name);
 
 extern char *
 ts_chunk_constraint_get_name_from_hypertable_constraint(Oid chunk_relid,
