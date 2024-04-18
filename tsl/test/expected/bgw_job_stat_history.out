@@ -334,7 +334,7 @@ ORDER BY id;
  job_id | succeeded |                                                                                                                                                                    data                                                                                                                                                                     
 --------+-----------+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
    1002 | t         | {"job": {"owner": "super_user", "proc_name": "custom_job_alter", "scheduled": true, "max_retries": -1, "max_runtime": "00:00:00", "proc_schema": "public", "retry_period": "00:05:00", "initial_start": "00:05:00", "fixed_schedule": true, "schedule_interval": "01:00:00"}}
-   1002 | t         | {"job": {"owner": "super_user", "timezone": "America/Sao_Paulo", "proc_name": "custom_job_alter", "scheduled": true, "max_retries": -1, "max_runtime": "00:00:00", "proc_schema": "public", "retry_period": "00:05:00", "initial_start": "00:05:00", "fixed_schedule": false, "schedule_interval": "00:10:00"}, "config": {"key": "value"}}
+   1002 | t         | {"job": {"owner": "super_user", "config": {"key": "value"}, "timezone": "America/Sao_Paulo", "proc_name": "custom_job_alter", "scheduled": true, "max_retries": -1, "max_runtime": "00:00:00", "proc_schema": "public", "retry_period": "00:05:00", "initial_start": "00:05:00", "fixed_schedule": false, "schedule_interval": "00:10:00"}}
 (2 rows)
 
 SELECT delete_job(:job_id_1);

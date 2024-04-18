@@ -325,7 +325,7 @@ SELECT
     h.pid,
     h.execution_start AS start_time,
     h.execution_finish AS finish_time,
-    h.data->'config' AS config,
+    h.data->'job'->'config' AS config,
     h.data->'error_data'->>'sqlerrcode' AS sqlerrcode,
     CASE
       WHEN h.succeeded IS FALSE AND h.data->'error_data'->>'message' IS NOT NULL THEN

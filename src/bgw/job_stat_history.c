@@ -46,6 +46,14 @@ build_job_info(BgwJob *job)
 	if (job->fd.hypertable_id != INVALID_HYPERTABLE_ID)
 		ts_jsonb_add_int32(parse_state, "hypertable_id", job->fd.hypertable_id);
 
+	if (job->fd.config != NULL)
+	{
+		/* config information jsonb*/
+		JsonbValue value = { 0 };
+		JsonbToJsonbValue(job->fd.config, &value);
+		ts_jsonb_add_value(parse_state, "config", &value);
+	}
+
 	if (strlen(NameStr(job->fd.check_schema)) > 0)
 		ts_jsonb_add_str(parse_state, "check_schema", NameStr(job->fd.check_schema));
 
@@ -70,13 +78,6 @@ ts_bgw_job_stat_history_build_data_info(BgwJobStatHistoryContext *context)
 	/* job information jsonb */
 	JsonbToJsonbValue(build_job_info(context->job), &value);
 	ts_jsonb_add_value(parse_state, "job", &value);
-
-	if (context->job->fd.config != NULL)
-	{
-		/* config information jsonb*/
-		JsonbToJsonbValue(context->job->fd.config, &value);
-		ts_jsonb_add_value(parse_state, "config", &value);
-	}
 
 	if (context->edata != NULL)
 	{
