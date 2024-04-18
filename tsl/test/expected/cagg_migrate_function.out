@@ -1,0 +1,203 @@
+-- This file and its contents are licensed under the Timescale License.
+-- Please see the included NOTICE for copyright information and
+-- LICENSE-TIMESCALE for a copy of the license.
+-- Prepare a hypertable
+CREATE TABLE temperature (
+  time timestamptz NOT NULL,
+  sensor int,
+  value float
+);
+SELECT create_hypertable('temperature', 'time');
+    create_hypertable     
+--------------------------
+ (1,public,temperature,t)
+(1 row)
+
+INSERT INTO temperature
+  SELECT time, sensor_id, sensor_id * sensor_id + 100
+    FROM generate_series('2000-01-01 0:00:00+0'::timestamptz, '2000-01-01 23:59:59+0','1m') g1(time),
+    generate_series(1, 2, 1) AS g2(sensor_id);
+-- Create a CAgg using time_bucket_ng
+SET timescaledb.debug_allow_cagg_with_deprecated_funcs = true;
+CREATE MATERIALIZED VIEW cagg_1_ng
+  WITH  (timescaledb.continuous) AS
+  SELECT timescaledb_experimental.time_bucket_ng('5 minutes', time, 'Europe/Berlin') as time, sensor, avg(value) AS avg
+    FROM temperature
+    GROUP BY 1,2
+    WITH NO DATA;
+-- Get the name of the direct and partial view
+SELECT format('%I.%I', partial_view_schema, partial_view_name)::regclass AS partial_view,
+       format('%I.%I', direct_view_schema, direct_view_name)::regclass AS direct_view
+  FROM _timescaledb_catalog.continuous_agg where user_view_name = 'cagg_1_ng'
+  \gset
+SELECT * FROM _timescaledb_catalog.continuous_aggs_bucket_function;
+ mat_hypertable_id |                                   bucket_func                                   | bucket_width | bucket_origin | bucket_offset | bucket_timezone | bucket_fixed_width 
+-------------------+---------------------------------------------------------------------------------+--------------+---------------+---------------+-----------------+--------------------
+                 2 | timescaledb_experimental.time_bucket_ng(interval,timestamp with time zone,text) | @ 5 mins     |               |               | Europe/Berlin   | f
+(1 row)
+
+SELECT pg_get_viewdef(:'partial_view', true);
+                                                               pg_get_viewdef                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text) AS "time",               +
+     temperature.sensor,                                                                                                                   +
+     avg(temperature.value) AS avg                                                                                                         +
+    FROM temperature                                                                                                                       +
+   GROUP BY (timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text)), temperature.sensor;
+(1 row)
+
+SELECT pg_get_viewdef(:'direct_view', true);
+                                                               pg_get_viewdef                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text) AS "time",               +
+     temperature.sensor,                                                                                                                   +
+     avg(temperature.value) AS avg                                                                                                         +
+    FROM temperature                                                                                                                       +
+   GROUP BY (timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text)), temperature.sensor;
+(1 row)
+
+SELECT pg_get_viewdef('cagg_1_ng', true);
+                      pg_get_viewdef                       
+-----------------------------------------------------------
+  SELECT _materialized_hypertable_2."time",               +
+     _materialized_hypertable_2.sensor,                   +
+     _materialized_hypertable_2.avg                       +
+    FROM _timescaledb_internal._materialized_hypertable_2;
+(1 row)
+
+CALL cagg_migrate_to_time_bucket('cagg_1_ng');
+SELECT * FROM _timescaledb_catalog.continuous_aggs_bucket_function;
+ mat_hypertable_id |                                      bucket_func                                      | bucket_width |        bucket_origin         | bucket_offset | bucket_timezone | bucket_fixed_width 
+-------------------+---------------------------------------------------------------------------------------+--------------+------------------------------+---------------+-----------------+--------------------
+                 2 | time_bucket(interval,timestamp with time zone,text,timestamp with time zone,interval) | @ 5 mins     | Fri Dec 31 16:00:00 1999 PST |               | Europe/Berlin   | f
+(1 row)
+
+SELECT pg_get_viewdef(:'partial_view', true);
+                                                                                   pg_get_viewdef                                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone) AS "time",               +
+     temperature.sensor,                                                                                                                                                           +
+     avg(temperature.value) AS avg                                                                                                                                                 +
+    FROM temperature                                                                                                                                                               +
+   GROUP BY (time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone)), temperature.sensor;
+(1 row)
+
+SELECT pg_get_viewdef(:'direct_view', true);
+                                                                                   pg_get_viewdef                                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone) AS "time",               +
+     temperature.sensor,                                                                                                                                                           +
+     avg(temperature.value) AS avg                                                                                                                                                 +
+    FROM temperature                                                                                                                                                               +
+   GROUP BY (time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone)), temperature.sensor;
+(1 row)
+
+SELECT pg_get_viewdef('cagg_1_ng', true);
+                      pg_get_viewdef                       
+-----------------------------------------------------------
+  SELECT _materialized_hypertable_2."time",               +
+     _materialized_hypertable_2.sensor,                   +
+     _materialized_hypertable_2.avg                       +
+    FROM _timescaledb_internal._materialized_hypertable_2;
+(1 row)
+
+-- Create a real-time CAgg using time_bucket_ng
+CREATE MATERIALIZED VIEW cagg_1_ng_rt
+  WITH  (timescaledb.continuous, timescaledb.materialized_only=false) AS
+  SELECT timescaledb_experimental.time_bucket_ng('5 minutes', time, 'Europe/Berlin') as time, sensor, avg(value) AS avg
+    FROM temperature
+    GROUP BY 1,2
+    WITH NO DATA;
+SELECT format('%I.%I', partial_view_schema, partial_view_name)::regclass AS partial_view,
+       format('%I.%I', direct_view_schema, direct_view_name)::regclass AS direct_view
+  FROM _timescaledb_catalog.continuous_agg where user_view_name = 'cagg_1_ng_rt'
+  \gset
+SELECT * FROM _timescaledb_catalog.continuous_aggs_bucket_function;
+ mat_hypertable_id |                                      bucket_func                                      | bucket_width |        bucket_origin         | bucket_offset | bucket_timezone | bucket_fixed_width 
+-------------------+---------------------------------------------------------------------------------------+--------------+------------------------------+---------------+-----------------+--------------------
+                 2 | time_bucket(interval,timestamp with time zone,text,timestamp with time zone,interval) | @ 5 mins     | Fri Dec 31 16:00:00 1999 PST |               | Europe/Berlin   | f
+                 3 | timescaledb_experimental.time_bucket_ng(interval,timestamp with time zone,text)       | @ 5 mins     |                              |               | Europe/Berlin   | f
+(2 rows)
+
+SELECT pg_get_viewdef(:'partial_view', true);
+                                                               pg_get_viewdef                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text) AS "time",               +
+     temperature.sensor,                                                                                                                   +
+     avg(temperature.value) AS avg                                                                                                         +
+    FROM temperature                                                                                                                       +
+   GROUP BY (timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text)), temperature.sensor;
+(1 row)
+
+SELECT pg_get_viewdef(:'direct_view', true);
+                                                               pg_get_viewdef                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text) AS "time",               +
+     temperature.sensor,                                                                                                                   +
+     avg(temperature.value) AS avg                                                                                                         +
+    FROM temperature                                                                                                                       +
+   GROUP BY (timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text)), temperature.sensor;
+(1 row)
+
+SELECT pg_get_viewdef('cagg_1_ng_rt', true);
+                                                                               pg_get_viewdef                                                                               
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT _materialized_hypertable_3."time",                                                                                                                                +
+     _materialized_hypertable_3.sensor,                                                                                                                                    +
+     _materialized_hypertable_3.avg                                                                                                                                        +
+    FROM _timescaledb_internal._materialized_hypertable_3                                                                                                                  +
+   WHERE _materialized_hypertable_3."time" < COALESCE(_timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(3)), '-infinity'::timestamp with time zone)+
+ UNION ALL                                                                                                                                                                 +
+  SELECT timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text) AS "time",                                               +
+     temperature.sensor,                                                                                                                                                   +
+     avg(temperature.value) AS avg                                                                                                                                         +
+    FROM temperature                                                                                                                                                       +
+   WHERE temperature."time" >= COALESCE(_timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(3)), '-infinity'::timestamp with time zone)              +
+   GROUP BY (timescaledb_experimental.time_bucket_ng('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text)), temperature.sensor;
+(1 row)
+
+CALL cagg_migrate_to_time_bucket('cagg_1_ng_rt');
+SELECT * FROM _timescaledb_catalog.continuous_aggs_bucket_function;
+ mat_hypertable_id |                                      bucket_func                                      | bucket_width |        bucket_origin         | bucket_offset | bucket_timezone | bucket_fixed_width 
+-------------------+---------------------------------------------------------------------------------------+--------------+------------------------------+---------------+-----------------+--------------------
+                 2 | time_bucket(interval,timestamp with time zone,text,timestamp with time zone,interval) | @ 5 mins     | Fri Dec 31 16:00:00 1999 PST |               | Europe/Berlin   | f
+                 3 | time_bucket(interval,timestamp with time zone,text,timestamp with time zone,interval) | @ 5 mins     | Fri Dec 31 16:00:00 1999 PST |               | Europe/Berlin   | f
+(2 rows)
+
+SELECT pg_get_viewdef(:'partial_view', true);
+                                                                                   pg_get_viewdef                                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone) AS "time",               +
+     temperature.sensor,                                                                                                                                                           +
+     avg(temperature.value) AS avg                                                                                                                                                 +
+    FROM temperature                                                                                                                                                               +
+   GROUP BY (time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone)), temperature.sensor;
+(1 row)
+
+SELECT pg_get_viewdef(:'direct_view', true);
+                                                                                   pg_get_viewdef                                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone) AS "time",               +
+     temperature.sensor,                                                                                                                                                           +
+     avg(temperature.value) AS avg                                                                                                                                                 +
+    FROM temperature                                                                                                                                                               +
+   GROUP BY (time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone)), temperature.sensor;
+(1 row)
+
+SELECT pg_get_viewdef('cagg_1_ng_rt', true);
+                                                                                   pg_get_viewdef                                                                                   
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  SELECT _materialized_hypertable_3."time",                                                                                                                                        +
+     _materialized_hypertable_3.sensor,                                                                                                                                            +
+     _materialized_hypertable_3.avg                                                                                                                                                +
+    FROM _timescaledb_internal._materialized_hypertable_3                                                                                                                          +
+   WHERE _materialized_hypertable_3."time" < COALESCE(_timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(3)), '-infinity'::timestamp with time zone)        +
+ UNION ALL                                                                                                                                                                         +
+  SELECT time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone) AS "time",               +
+     temperature.sensor,                                                                                                                                                           +
+     avg(temperature.value) AS avg                                                                                                                                                 +
+    FROM temperature                                                                                                                                                               +
+   WHERE temperature."time" >= COALESCE(_timescaledb_functions.to_timestamp(_timescaledb_functions.cagg_watermark(3)), '-infinity'::timestamp with time zone)                      +
+   GROUP BY (time_bucket('@ 5 mins'::interval, temperature."time", 'Europe/Berlin'::text, origin => 'Fri Dec 31 16:00:00 1999 PST'::timestamp with time zone)), temperature.sensor;
+(1 row)
+

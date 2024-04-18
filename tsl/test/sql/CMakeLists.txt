@@ -72,6 +72,7 @@ if(CMAKE_BUILD_TYPE MATCHES Debug)
     cagg_dump.sql
     cagg_joins.sql
     cagg_migrate.sql
+    cagg_migrate_function.sql
     cagg_multi.sql
     cagg_on_cagg.sql
     cagg_on_cagg_joins.sql

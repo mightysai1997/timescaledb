@@ -3,7 +3,14 @@
  * Please see the included NOTICE for copyright information and
  * LICENSE-TIMESCALE for a copy of the license.
  */
+#include <postgres.h>
+#include <commands/view.h>
+#include <storage/lmgr.h>
+#include <utils/timestamp.h>
 
+#include "extension.h"
+#include "time_bucket.h"
+#include "guc.h"
 #include "utils.h"
 
 enum
@@ -18,6 +25,7 @@ enum
 };
 
 #define Natts_cagg_validate_query (_Anum_cagg_validate_query_max - 1)
+#define ORIGIN_PARAMETER_NAME "origin"
 
 static Datum
 create_cagg_validate_query_datum(TupleDesc tupdesc, const bool is_valid_query,
@@ -141,4 +149,382 @@ continuous_agg_validate_query(PG_FUNCTION_ARGS)
 	PG_END_TRY();
 
 	PG_RETURN_DATUM(create_cagg_validate_query_datum(tupdesc, is_valid_query, edata));
+}
+
+/*
+ * Find proper time_bucket replacement for time_bucket_ng function
+ */
+static Oid
+get_replacement_timebucket_function(const ContinuousAgg *cagg)
+{
+	Oid bucket_function = cagg->bucket_function->bucket_function;
+	Assert(OidIsValid(bucket_function));
+
+	FuncInfo *func_info = ts_func_cache_get(bucket_function);
+	Ensure(func_info != NULL, "unable to get function info for Oid %d", bucket_function);
+
+	/* Check if the CAgg is actually using a deprecated time_bucket_ng function */
+	if (!IS_DEPRECATED_TIME_BUCKET_NG_FUNC(func_info))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("CAgg %s does not use a deprecated bucket function",
+						get_rel_name(cagg->relid))));
+	}
+
+	/* Return values of func_get_detail */
+	Oid funcid;
+	Oid rettype;
+	bool retset;
+	int nvargs;
+	Oid vatype;
+	Oid *declared_arg_types;
+	List *argdefaults;
+
+	List *arg_names = NIL;
+	int func_nargs = func_info->nargs;
+	Oid *func_arg_types = func_info->arg_types;
+
+	/* Add argument for new origin value */
+	if (cagg->bucket_function->bucket_time_based &&
+		TIMESTAMP_NOT_FINITE(cagg->bucket_function->bucket_time_origin))
+	{
+		/* Create a new private copy of the arguments with space for n+1 Oids. We don't want to
+		 * modify the entry in the catalog cache.
+		 */
+		Assert(!OidIsValid(func_arg_types[func_nargs]));
+		func_arg_types = palloc0((func_nargs + 1) * sizeof(Oid));
+		memcpy(func_arg_types, func_info->arg_types, func_nargs * sizeof(Oid));
+		Assert(!OidIsValid(func_arg_types[func_nargs]));
+
+		/* Add new origin parameter */
+		func_arg_types[func_nargs] = TIMESTAMPTZOID;
+		arg_names = list_make1(ORIGIN_PARAMETER_NAME);
+		func_nargs++;
+	}
+
+	FuncDetailCode fdresult = func_get_detail(list_make1(makeString("time_bucket")),
+											  NIL,
+											  arg_names,
+											  func_nargs,
+											  func_arg_types,
+											  true /* expand_variadic */,
+											  true /* expand_defaults */,
+#if PG14_GE
+											  false /* include_out_arguments */,
+#endif
+											  &funcid,
+											  &rettype,
+											  &retset,
+											  &nvargs,
+											  &vatype,
+											  &declared_arg_types,
+											  &argdefaults);
+
+	if (fdresult == FUNCDETAIL_NOTFOUND)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("unable to find replacement for function %s", func_info->funcname)));
+	}
+
+	Assert(fdresult == FUNCDETAIL_NORMAL);
+
+	FuncInfo *func_info_new = ts_func_cache_get(funcid);
+	Ensure(func_info_new != NULL, "unable to get function info for Oid %d", funcid);
+	Ensure(func_info_new->allowed_in_cagg_definition,
+		   "new time_bucket function is not allowed in CAggs");
+
+	return funcid;
+}
+
+/*
+ * Update the cagg bucket function catalog table. During the migration, we set a new bucket
+ * function and a origin if the bucket function is time based.
+ */
+static ScanTupleResult
+cagg_time_bucket_update(TupleInfo *ti, void *data)
+{
+	bool should_free;
+	HeapTuple tuple = ts_scanner_fetch_heap_tuple(ti, false, &should_free);
+	TupleDesc tupleDesc = ts_scanner_get_tupledesc(ti);
+	const ContinuousAgg *cagg = (ContinuousAgg *) data;
+
+	Datum values[Natts_continuous_aggs_bucket_function] = { 0 };
+	bool isnull[Natts_continuous_aggs_bucket_function] = { 0 };
+	bool doReplace[Natts_continuous_aggs_bucket_function] = { 0 };
+
+	/* Update the bucket function */
+	values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_function)] =
+		ObjectIdGetDatum(cagg->bucket_function->bucket_function);
+	doReplace[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_function)] = true;
+
+	/* Set new origin if not already present. Time_bucket and time_bucket_ng use different
+	 * origin values for time based values.
+	 */
+	if (cagg->bucket_function->bucket_time_based)
+	{
+		char *origin_value = DatumGetCString(
+			DirectFunctionCall1(timestamptz_out,
+								TimestampTzGetDatum(cagg->bucket_function->bucket_time_origin)));
+
+		values[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_bucket_origin)] =
+			CStringGetTextDatum(origin_value);
+
+		doReplace[AttrNumberGetAttrOffset(Anum_continuous_aggs_bucket_function_bucket_origin)] =
+			true;
+	}
+
+	HeapTuple new_tuple = heap_modify_tuple(tuple, tupleDesc, values, isnull, doReplace);
+
+	ts_catalog_update(ti->scanrel, new_tuple);
+
+	heap_freetuple(new_tuple);
+
+	if (should_free)
+		heap_freetuple(tuple);
+
+	return SCAN_DONE;
+}
+
+/*
+ * Search for the bucket function entry in the catalog and update the values.
+ */
+static int
+replace_time_bucket_function_in_catalog(ContinuousAgg *cagg)
+{
+	ScanKeyData scankey[1];
+
+	ScanKeyInit(&scankey[0],
+				Anum_continuous_aggs_bucket_function_pkey_mat_hypertable_id,
+				BTEqualStrategyNumber,
+				F_INT4EQ,
+				Int32GetDatum(cagg->data.mat_hypertable_id));
+
+	Catalog *catalog = ts_catalog_get();
+
+	ScannerCtx scanctx = {
+		.table = catalog_get_table_id(catalog, CONTINUOUS_AGGS_BUCKET_FUNCTION),
+		.index = catalog_get_index(catalog,
+								   CONTINUOUS_AGGS_BUCKET_FUNCTION,
+								   CONTINUOUS_AGGS_BUCKET_FUNCTION_PKEY_IDX),
+		.nkeys = 1,
+		.scankey = scankey,
+		.data = cagg,
+		.limit = 1,
+		.tuple_found = cagg_time_bucket_update,
+		.lockmode = AccessShareLock,
+		.scandirection = ForwardScanDirection,
+	};
+
+	return ts_scanner_scan(&scanctx);
+}
+
+typedef struct TimeBucketInfoContext
+{
+	/* The updated cagg definition */
+	const ContinuousAgg *cagg;
+
+	/* The Oid of the old bucket function that should be replaced */
+	Oid function_to_replace;
+
+	/* Was the defined origin added during the migration and needs
+	 * to be added to the function parameters during rewrite? */
+	bool origin_added_during_migration;
+} TimeBucketInfoContext;
+
+/*
+ * Replace the old time_bucket_ng function with the time_bucket function. Add a custom origin if
+ * needed.
+ */
+static Node *
+cagg_user_query_mutator(Node *node, TimeBucketInfoContext *context)
+{
+	Assert(context != NULL);
+
+	if (node == NULL)
+		return NULL;
+
+	if (IsA(node, FuncExpr))
+	{
+		FuncExpr *funcExpr = castNode(FuncExpr, node);
+
+		if (context->function_to_replace == funcExpr->funcid)
+		{
+			FuncExpr *new_func = (FuncExpr *) copyObject(node);
+			new_func->funcid = context->cagg->bucket_function->bucket_function;
+
+			/* Ensure the new bucket function produces the same buckets as the old one */
+			if (context->origin_added_during_migration)
+			{
+				Assert(context->cagg->bucket_function->bucket_time_based);
+				Datum timestamp_datum =
+					TimestampTzGetDatum(context->cagg->bucket_function->bucket_time_origin);
+
+				/* The new origin value for the function */
+				Const *argument_value = makeConst(TIMESTAMPTZOID /* consttype */,
+												  -1 /* consttypmod */,
+												  InvalidOid /* constcollid */,
+												  sizeof(TimestampTz) /* constlen */,
+												  timestamp_datum /* constvalue */,
+												  false /* constisnull */,
+												  FLOAT8PASSBYVAL /* constbyval */
+				);
+
+				/* Build wrapping named arg node */
+				NamedArgExpr *origin_arg = makeNode(NamedArgExpr);
+				origin_arg->argnumber = list_length(funcExpr->args) + 1;
+				origin_arg->location = -1;
+				origin_arg->name = ORIGIN_PARAMETER_NAME;
+				origin_arg->arg = (Expr *) argument_value;
+
+				new_func->args = lappend(new_func->args, origin_arg);
+			}
+
+			return (Node *) new_func;
+		}
+	}
+	else if (IsA(node, Query))
+	{
+		/* Recurse into subselects */
+		Query *query = castNode(Query, node);
+		return (Node *) query_tree_mutator(query, cagg_user_query_mutator, context, 0);
+	}
+
+	return expression_tree_mutator(node, cagg_user_query_mutator, context);
+}
+
+/*
+ * Rewrite the given CAgg view and replace the bucket function
+ */
+static void
+continuous_agg_rewrite_view(Oid view_oid, const ContinuousAgg *cagg, Oid function_to_replace,
+							bool origin_added_during_migration)
+{
+	int sec_ctx;
+	Oid uid, saved_uid;
+
+	Relation direct_view_rel = relation_open(view_oid, AccessShareLock);
+	Query *direct_query = copyObject(get_view_query(direct_view_rel));
+
+	/* Keep lock until end of transaction. */
+	relation_close(direct_view_rel, NoLock);
+
+	RemoveRangeTableEntries(direct_query);
+
+	/* Update bucket function in CAgg query */
+	TimeBucketInfoContext context = { 0 };
+	context.cagg = cagg;
+	context.function_to_replace = function_to_replace;
+	context.origin_added_during_migration = origin_added_during_migration;
+
+	Query *updated_direct_query =
+		(Query *) cagg_user_query_mutator((Node *) direct_query, &context);
+
+	/* Store updated CAgg query */
+	SWITCH_TO_TS_USER(NameStr(cagg->data.user_view_schema), uid, saved_uid, sec_ctx);
+	StoreViewQuery(view_oid, updated_direct_query, true);
+	CommandCounterIncrement();
+	RESTORE_USER(uid, saved_uid, sec_ctx);
+}
+
+/*
+ * Replace the bucket function in the CAgg view definition
+ */
+static void
+continuous_agg_replace_function(const ContinuousAgg *cagg, Oid function_to_replace,
+								bool origin_added_during_migration)
+{
+	/* Rewrite the direct_view */
+	Oid direct_view_oid = ts_get_relation_relid(NameStr(cagg->data.direct_view_schema),
+												NameStr(cagg->data.direct_view_name),
+												false);
+
+	continuous_agg_rewrite_view(direct_view_oid,
+								cagg,
+								function_to_replace,
+								origin_added_during_migration);
+
+	/* Rewrite the partial_view */
+	Oid partial_view_oid = ts_get_relation_relid(NameStr(cagg->data.partial_view_schema),
+												 NameStr(cagg->data.partial_view_name),
+												 false);
+
+	continuous_agg_rewrite_view(partial_view_oid,
+								cagg,
+								function_to_replace,
+								origin_added_during_migration);
+
+	/* Rewrite the user facing view if needed */
+	if (!cagg->data.materialized_only)
+	{
+		Oid user_view_oid = ts_get_relation_relid(NameStr(cagg->data.user_view_schema),
+												  NameStr(cagg->data.user_view_name),
+												  false);
+
+		continuous_agg_rewrite_view(user_view_oid,
+									cagg,
+									function_to_replace,
+									origin_added_during_migration);
+	}
+}
+
+/*
+ * Migrate a CAgg which is using time_bucket_ng as a bucket function into
+ * a CAgg which is using the regular time_bucket function.
+ */
+Datum
+continuous_agg_migrate_to_time_bucket(PG_FUNCTION_ARGS)
+{
+	Oid cagg_relid = PG_ARGISNULL(0) ? InvalidOid : PG_GETARG_OID(0);
+
+	ts_feature_flag_check(FEATURE_CAGG);
+
+	ContinuousAgg *cagg = get_cagg_by_relid_or_fail(cagg_relid);
+	Assert(cagg_relid == cagg->relid);
+
+	/* Ensure CAgg is not updated/deleted by somebody else concurrently. Should be moved
+	 * into the scanner since the CAgg can be deleted after we found it in the catalog. */
+	Assert(OidIsValid(cagg_relid));
+	LockRelationOid(cagg_relid, ShareUpdateExclusiveLock);
+
+	/* Get the new time_bucket replacement function */
+	Oid new_bucket_function = get_replacement_timebucket_function(cagg);
+	Oid old_bucket_function = cagg->bucket_function->bucket_function;
+
+	Assert(OidIsValid(new_bucket_function));
+	Assert(new_bucket_function != cagg->bucket_function->bucket_function);
+
+	/* Update the time_bucket_fuction */
+	cagg->bucket_function->bucket_function = new_bucket_function;
+	bool origin_added_during_migration = false;
+
+	/* Set new origin if not already present. Time_bucket and time_bucket_ng use different
+	 * origin values.
+	 */
+	if (cagg->bucket_function->bucket_time_based &&
+		TIMESTAMP_NOT_FINITE(cagg->bucket_function->bucket_time_origin))
+	{
+		cagg->bucket_function->bucket_time_origin =
+			DatumGetTimestampTz(DirectFunctionCall3(timestamptz_in,
+													CStringGetDatum(TIME_BUCKET_NG_DEFAULT_ORIGIN),
+													ObjectIdGetDatum(InvalidOid),
+													Int32GetDatum(-1)));
+		origin_added_during_migration = true;
+	}
+
+	/* Update the catalog */
+	replace_time_bucket_function_in_catalog(cagg);
+
+	/* Fetch new CAgg definition from catalog */
+	ContinuousAgg *new_cagg_definition = get_cagg_by_relid_or_fail(cagg_relid);
+	Assert(new_cagg_definition->bucket_function->bucket_function == new_bucket_function);
+	Assert(cagg->bucket_function->bucket_time_origin ==
+		   new_cagg_definition->bucket_function->bucket_time_origin);
+
+	/* Modify the CAgg view definition */
+	continuous_agg_replace_function(cagg, old_bucket_function, origin_added_during_migration);
+
+	/* The migration is a procedure, no return value is expected */
+	PG_RETURN_VOID();
 }

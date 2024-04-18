@@ -392,3 +392,6 @@ DROP FUNCTION IF EXISTS _timescaledb_functions.policy_job_error_retention_check(
 --
 -- END bgw_job_stat_history
 --
+
+CREATE PROCEDURE @extschema@.cagg_migrate_to_time_bucket(cagg REGCLASS)
+   AS '@MODULE_PATHNAME@', 'ts_continuous_agg_migrate_to_time_bucket' LANGUAGE C;

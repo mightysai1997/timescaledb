@@ -10,6 +10,8 @@
 
 #include "export.h"
 
+#define TIME_BUCKET_NG_DEFAULT_ORIGIN "2000-01-01 00:00:00+00"
+
 extern TSDLLEXPORT Datum ts_int16_bucket(PG_FUNCTION_ARGS);
 extern TSDLLEXPORT Datum ts_int32_bucket(PG_FUNCTION_ARGS);
 extern TSDLLEXPORT Datum ts_int64_bucket(PG_FUNCTION_ARGS);
