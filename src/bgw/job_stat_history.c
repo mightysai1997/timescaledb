@@ -52,36 +52,36 @@ build_job_info(BgwJob *job)
 	if (strlen(NameStr(job->fd.check_name)) > 0)
 		ts_jsonb_add_str(parse_state, "check_name", NameStr(job->fd.check_name));
 
-	if (job->fd.timezone)
+	if (job->fd.timezone != NULL)
 		ts_jsonb_add_str(parse_state, "timezone", text_to_cstring(job->fd.timezone));
 
 	return JsonbValueToJsonb(pushJsonbValue(&parse_state, WJB_END_OBJECT, NULL));
 }
 
 static Jsonb *
-ts_bgw_job_stat_history_build_data_info(BgwJob *job, Jsonb *error_data)
+ts_bgw_job_stat_history_build_data_info(BgwJobStatHistoryContext *context)
 {
 	JsonbParseState *parse_state = NULL;
 	JsonbValue value = { 0 };
 	pushJsonbValue(&parse_state, WJB_BEGIN_OBJECT, NULL);
 
-	Assert(job != NULL);
+	Assert(context->job != NULL);
 
 	/* job information jsonb */
-	JsonbToJsonbValue(build_job_info(job), &value);
+	JsonbToJsonbValue(build_job_info(context->job), &value);
 	ts_jsonb_add_value(parse_state, "job", &value);
 
-	if (job->fd.config != NULL)
+	if (context->job->fd.config != NULL)
 	{
 		/* config information jsonb*/
-		JsonbToJsonbValue(job->fd.config, &value);
+		JsonbToJsonbValue(context->job->fd.config, &value);
 		ts_jsonb_add_value(parse_state, "config", &value);
 	}
 
-	if (error_data != NULL)
+	if (context->edata != NULL)
 	{
 		/* error information jsonb */
-		JsonbToJsonbValue(error_data, &value);
+		JsonbToJsonbValue(context->edata, &value);
 		ts_jsonb_add_value(parse_state, "error_data", &value);
 	}
 
@@ -91,6 +91,8 @@ ts_bgw_job_stat_history_build_data_info(BgwJob *job, Jsonb *error_data)
 static void
 ts_bgw_job_stat_history_insert(BgwJobStatHistoryContext *context)
 {
+	Assert(context != NULL);
+
 	Relation rel = table_open(catalog_get_table_id(ts_catalog_get(), BGW_JOB_STAT_HISTORY),
 							  ShareRowExclusiveLock);
 	TupleDesc desc = RelationGetDescr(rel);
@@ -104,25 +106,13 @@ ts_bgw_job_stat_history_insert(BgwJobStatHistoryContext *context)
 							 context->job->job_history.execution_start,
 							 false);
 	ts_datum_set_timestamptz(Anum_bgw_job_stat_history_execution_finish, values, 0, true);
-
-	/* In case of the GUC be disabled all errors are logged then the `context` will contain
-	 * `error_data` information */
-	if (context != NULL)
-	{
-		ts_datum_set_timestamptz(Anum_bgw_job_stat_history_execution_finish,
-								 values,
-								 ts_timer_get_current_timestamp(),
-								 false);
-		ts_datum_set_jsonb(Anum_bgw_job_stat_history_data,
-						   values,
-						   ts_bgw_job_stat_history_build_data_info(context->job, context->edata));
-	}
-	else
-	{
-		ts_datum_set_jsonb(Anum_bgw_job_stat_history_data,
-						   values,
-						   ts_bgw_job_stat_history_build_data_info(context->job, NULL));
-	}
+	ts_datum_set_timestamptz(Anum_bgw_job_stat_history_execution_finish,
+							 values,
+							 ts_timer_get_current_timestamp(),
+							 false);
+	ts_datum_set_jsonb(Anum_bgw_job_stat_history_data,
+					   values,
+					   ts_bgw_job_stat_history_build_data_info(context));
 
 	ts_catalog_database_info_become_owner(ts_catalog_database_info_get(), &sec_ctx);
 
@@ -222,15 +212,13 @@ bgw_job_stat_history_tuple_mark_end(TupleInfo *ti, void *const data)
 		BoolGetDatum((context->result == JOB_SUCCESS));
 	doReplace[AttrNumberGetAttrOffset(Anum_bgw_job_stat_history_succeeded)] = true;
 
-	if (context->job->fd.config != NULL || context->edata != NULL)
-	{
-		Jsonb *data = ts_bgw_job_stat_history_build_data_info(context->job, context->edata);
+	Jsonb *job_history_data = ts_bgw_job_stat_history_build_data_info(context);
 
-		if (data != NULL)
-		{
-			values[AttrNumberGetAttrOffset(Anum_bgw_job_stat_history_data)] = JsonbPGetDatum(data);
-			doReplace[AttrNumberGetAttrOffset(Anum_bgw_job_stat_history_data)] = true;
-		}
+	if (job_history_data != NULL)
+	{
+		values[AttrNumberGetAttrOffset(Anum_bgw_job_stat_history_data)] =
+			JsonbPGetDatum(job_history_data);
+		doReplace[AttrNumberGetAttrOffset(Anum_bgw_job_stat_history_data)] = true;
 	}
 
 	HeapTuple new_tuple =
