@@ -106,6 +106,7 @@ extern bool ts_osm_chunk_range_overlaps(int32 osm_dimension_slice_id, int32 dime
 
 extern int ts_dimension_slice_update_by_id(int32 dimension_slice_id,
 										   FormData_dimension_slice *fd_slice);
+extern int ts_dimension_slice_range_update(DimensionSlice *slice);
 
 #define dimension_slice_insert(slice) ts_dimension_slice_insert_multi(&(slice), 1)
 
