@@ -294,3 +294,6 @@ SET
   check_name = 'policy_job_error_retention_check'
 WHERE
   id = 2;
+
+
+DROP PROCEDURE IF EXISTS @extschema@.cagg_migrate_to_time_bucket(cagg REGCLASS);

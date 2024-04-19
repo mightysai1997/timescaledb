@@ -216,6 +216,7 @@ ORDER BY pronamespace::regnamespace::text COLLATE "C", p.oid::regprocedure::text
  by_hash(name,integer,regproc)
  by_range(name,anyelement,regproc)
  cagg_migrate(regclass,boolean,boolean)
+ cagg_migrate_to_time_bucket(regclass)
  chunk_compression_stats(regclass)
  chunks_detailed_size(regclass)
  compress_chunk(regclass,boolean,boolean)
